@@ -2089,22 +2089,44 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                 HookRunner([hook for _, hook in pairs], [key for key, _ in pairs]).refund(snapshot, call)
             return json.loads(json.dumps(snapshot.state, default=str)) or None
 
+    def _tools_in_reach(self, inherited: bool, seen: set[int] | None = None) -> list[Node] | None:
+        """The agent's tools, plus its sub-agents' for an inheriting hook; None if a sub-agent is built per call."""
+        # Imported here: the sub-agent tool's module imports this one.
+        from dynamiq.nodes.tools.agent_tool import SubAgentTool
+
+        seen = {id(self)} if seen is None else seen | {id(self)}
+        tools = list(self._all_runtime_tools)
+        if not inherited:
+            return tools
+        for tool in self._all_runtime_tools:
+            if not isinstance(tool, SubAgentTool) or id(tool.agent) in seen:
+                continue
+            below = tool.agent._tools_in_reach(inherited, seen) if isinstance(tool.agent, Agent) else None
+            if below is None:
+                return None
+            tools += below
+        return tools
+
     def _warn_about_unknown_hook_tools(self) -> None:
-        """A hook naming a tool the agent does not have never matches; warn once (a deployment may drop tools)."""
+        """A hook naming a tool no agent it applies in has never matches; warn once (a deployment may drop tools)."""
         if self._hook_tools_checked or not self.hooks:
             return
         self._hook_tools_checked = True
-        tools = [
-            (self.sanitize_tool_name(tool.name), getattr(getattr(tool, "_owner_server", None), "name", None))
-            for tool in self._all_runtime_tools
-        ]
         for hook in self.hooks:
+            tools = self._tools_in_reach(hook.inherit)
+            if tools is None:
+                continue
             for entry in hook.tools:
                 probe = hook.model_copy(update={"tools": [entry]})
-                if entry != "*" and not any(probe.matches_tool(name, group) for name, group in tools):
+                if entry != "*" and not any(
+                    probe.matches_tool(tool.name, getattr(getattr(tool, "_owner_server", None), "name", None))
+                    or probe.lists_tool_id(tool.authored_id)
+                    for tool in tools
+                ):
+                    owners = "neither this agent nor a sub-agent below it has" if hook.inherit else "this agent lacks"
                     logger.warning(
                         f"Agent {self.name} - {self.id}: hook '{hook.display_name}' lists tool '{entry}', "
-                        f"which this agent does not have; it will never match."
+                        f"which {owners}; it will never match."
                     )
 
     def _live_answer_filter(self) -> LiveAnswerFilter | None:
@@ -2331,7 +2353,7 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             return ToolCall(
                 name=tool.name,
                 input=tool_input,
-                tool_id=tool.id,
+                tool_id=tool.authored_id,
                 is_sub_agent=is_child_agent,
                 group=getattr(getattr(tool, "_owner_server", None), "name", None),
             )
@@ -3383,6 +3405,7 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             for tool in tools
             if not any(
                 hook.hides_tool(tool.name, getattr(getattr(tool, "_owner_server", None), "name", None))
+                or (hook.lists_tool_id(tool.authored_id) and hook.hides_tool(tool.authored_id))
                 for hook in hiding
             )
         ]

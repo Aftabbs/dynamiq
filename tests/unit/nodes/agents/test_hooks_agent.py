@@ -3,6 +3,7 @@
 import json
 import re
 import threading
+from contextlib import ExitStack
 from typing import ClassVar
 
 import pytest
@@ -525,6 +526,162 @@ def test_a_tool_name_that_matches_nothing_is_reported_with_a_warning(monkeypatch
         [final_step("ok")],
     )
     assert any("delete-custmer" in w and "never match" in w for w in warnings)
+
+
+def hook_warnings(monkeypatch) -> list[str]:
+    from dynamiq.nodes.agents import base
+
+    warnings: list[str] = []
+    monkeypatch.setattr(base.logger, "warning", lambda message, *a, **k: warnings.append(str(message)))
+    return warnings
+
+
+def test_an_inherited_hook_on_a_sub_agents_tool_is_not_reported_as_matching_nothing(monkeypatch):
+    warnings = hook_warnings(monkeypatch)
+    parent, child = parent_with_child([ToolPolicyHook(tools=["search"], deny=True, inherit=True)])
+    child.tools = [SearchTool()]
+    steps = [tool_step("Researcher", input="q"), final_step("ok")]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="c"), final_step("done")]):
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert tool_inputs("search") == []
+    assert not [w for w in warnings if "never match" in w]
+
+
+@pytest.mark.parametrize(
+    ("policy", "sub_agent_tools"),
+    [
+        (dict(tools=["serach"], inherit=True), [SearchTool]),  # a typo no agent below has either
+        (dict(tools=["search"]), [SearchTool]),  # not inherited, so the sub-agent's tool is out of reach
+        (dict(tools=["search"], inherit=True), []),
+    ],
+)
+def test_a_hook_tool_that_no_agent_it_applies_in_has_is_still_reported(monkeypatch, policy, sub_agent_tools):
+    warnings = hook_warnings(monkeypatch)
+    parent, child = parent_with_child([ToolPolicyHook(deny=True, **policy)])
+    child.tools = [tool() for tool in sub_agent_tools]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [final_step("done")]):
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")])
+    assert [w for w in warnings if policy["tools"][0] in w and "never match" in w]
+
+
+def test_an_inherited_hook_on_a_sub_agent_built_per_call_is_not_reported(monkeypatch):
+    warnings = hook_warnings(monkeypatch)
+
+    def blueprint():
+        return build_agent([], tools=[SearchTool()], name="Researcher", id="child")
+
+    parent = build_agent(
+        [ToolPolicyHook(tools=["search"], deny=True, inherit=True)],
+        tools=[SubAgentTool(agent_factory=blueprint, name="Researcher", description="researches")],
+        delegation_allowed=True,
+    )
+    run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")])
+    assert not [w for w in warnings if "never match" in w]
+
+
+@modes
+def test_a_policy_that_names_a_tools_id_survives_its_rename(mode, monkeypatch):
+    warnings = hook_warnings(monkeypatch)
+    agent = build_agent(
+        [ToolPolicyHook(tools=["email-tool"], deny=True, on_violation=BlockAs.FAIL, message="no mail")],
+        tools=[SearchTool(), EmailTool(id="email-tool", name="send-mail")],
+    )
+    result, _ = run_scripted(agent, mode, [tool_step("send-mail", to="a@b.c"), final_step("ok")])
+    assert result.status == RunnableStatus.FAILURE and "no mail" in str(result.error.message)
+    assert tool_inputs("send-mail") == []
+    assert not [w for w in warnings if "never match" in w]
+
+
+def test_a_tool_denied_by_its_id_is_not_offered_to_the_model():
+    agent = build_agent(
+        [ToolPolicyHook(tools=["email-tool"], deny=True)],
+        tools=[SearchTool(), EmailTool(id="email-tool", name="send-mail")],
+    )
+    assert "send-mail" not in agent.tool_description and "search" in agent.tool_description
+
+
+@modes
+def test_a_hook_that_names_a_tools_id_applies_in_every_map_item(mode):
+    agent = build_agent(
+        [CallLimitHook(tools=["search-tool"], max_per_run=1)], tools=[SearchTool(id="search-tool", name="lookup")]
+    )
+    steps = [tool_step("lookup", query="a"), tool_step("lookup", query="b"), final_step("ok")]
+    with scripted_stateless(mode, steps, agents=[agent]):
+        result = Map(node=agent, max_workers=3).run(input_data={"input": [{"input": f"item {i}"} for i in range(3)]})
+    assert result.status == RunnableStatus.SUCCESS
+    assert len(tool_inputs("lookup")) == 3
+
+
+def test_a_hook_that_names_a_tools_id_counts_its_parallel_calls():
+    agent = build_agent(
+        [CallLimitHook(tools=["search-tool"], max_per_run=1)], tools=[SearchTool(id="search-tool", name="lookup")]
+    )
+    calls = [("lookup", {"query": "first"}), ("lookup", {"query": "second"})]
+    run_scripted(agent, InferenceMode.FUNCTION_CALLING, [parallel_step(*calls), final_step("ok")])
+    assert len(tool_inputs("lookup")) == 1
+
+
+def test_an_inherited_policy_that_names_a_tools_id_applies_in_a_sub_agent_built_per_call():
+    with ExitStack() as scripts:
+
+        def blueprint():
+            child = build_agent([], tools=[EmailTool(id="email-tool", name="send-mail")], name="Researcher", id="child")
+            steps = [tool_step("send-mail", to="a@b.c"), final_step("done")]
+            scripts.enter_context(scripted(child, InferenceMode.STRUCTURED_OUTPUT, steps))
+            return child
+
+        parent = build_agent(
+            [ToolPolicyHook(tools=["email-tool"], deny=True, inherit=True)],
+            tools=[SubAgentTool(agent_factory=blueprint, name="Researcher", description="researches")],
+            delegation_allowed=True,
+        )
+        steps = [tool_step("Researcher", input="q"), final_step("ok")]
+        result, _ = run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert result.status == RunnableStatus.SUCCESS and tool_inputs("send-mail") == []
+
+
+def test_agents_that_hold_each_other_do_not_stop_the_check_of_an_inherited_hook(monkeypatch):
+    warnings = hook_warnings(monkeypatch)
+    parent, child = parent_with_child([ToolPolicyHook(tools=["serach"], deny=True, inherit=True)])
+    child.tools = [SubAgentTool(agent=parent, name="Lead", description="leads")]
+    result, _ = run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")])
+    assert result.status == RunnableStatus.SUCCESS
+    assert [w for w in warnings if "serach" in w and "never match" in w]
+
+
+def test_an_approval_and_a_call_limit_that_name_a_tools_id_apply_to_it(human):
+    approvals = human("", "")
+    hooks = [
+        ToolPolicyHook(tools=["search-tool"], approval=True),
+        CallLimitHook(tools=["search-tool"], max_per_run=1),
+    ]
+    agent = build_agent(hooks, tools=[SearchTool(id="search-tool", name="lookup"), EmailTool()])
+    steps = [tool_step("lookup", query="a"), tool_step("lookup", query="b"), tool_step("send-email"), final_step("ok")]
+    run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert [args["query"] for args in tool_inputs("lookup")] == ["a"]
+    assert len(approvals.shown) == 1 and "'lookup'" in approvals.shown[0]
+    assert len(tool_inputs("send-email")) == 1
+
+
+def test_a_call_limit_that_names_a_tools_id_gets_a_declined_call_back(human):
+    human("no", "")
+    hooks = [
+        CallLimitHook(tools=["search-tool"], max_per_run=1),
+        ToolPolicyHook(tools=["search-tool"], approval=True),
+    ]
+    agent = build_agent(hooks, tools=[SearchTool(id="search-tool", name="lookup")])
+    steps = [tool_step("lookup", query="a"), tool_step("lookup", query="b"), final_step("ok")]
+    run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert [args["query"] for args in tool_inputs("lookup")] == ["b"]
+
+
+def test_a_pattern_does_not_reach_a_tool_through_its_id():
+    agent = build_agent(
+        [ToolPolicyHook(tools=["send-*"], deny=True, on_violation=BlockAs.FAIL)],
+        tools=[SearchTool(id="send-search", name="lookup"), EmailTool()],
+    )
+    result, _ = run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, [tool_step("lookup", query="a"), final_step("ok")])
+    assert result.status == RunnableStatus.SUCCESS and len(tool_inputs("lookup")) == 1
 
 
 def test_hooks_are_dumped_with_all_their_fields():
