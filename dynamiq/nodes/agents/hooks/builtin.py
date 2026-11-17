@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_serializer
 from dynamiq.connections import BaseConnection, HuggingFace, Lakera, Replicate
 from dynamiq.nodes.agents.hooks.core import (
     ALLOW,
+    TRUSTED_SCOPE_KEY,
     Ask,
     Block,
     BlockAs,
@@ -615,10 +616,15 @@ _MAX_SESSION_STORES = 1000
 
 def _session_key(ctx: HookContext) -> tuple | None:
     """The key of the hook's mapping in ``_SESSION_STORES``, or ``None`` when the run keeps its own (see
-    ``_locked_store``)."""
+    ``_locked_store``). With a scope under ``TRUSTED_SCOPE_KEY`` it holds only that scope and the trusted
+    ``user_id``, since the rest of the context, such as the caller's role, may change between turns."""
     if not (ctx.trusted and (ctx.session_id or ctx.user_id)):
         return None
-    return json.dumps(ctx.trusted, sort_keys=True, default=str), ctx.hook_key, ctx.user_id, ctx.session_id
+    if scope := ctx.trusted.get(TRUSTED_SCOPE_KEY):
+        within = {"scope": scope, "user_id": ctx.trusted.get("user_id")}
+    else:
+        within = {"context": ctx.trusted}
+    return json.dumps(within, sort_keys=True, default=str), ctx.hook_key, ctx.user_id, ctx.session_id
 
 
 def _held_placeholders(ctx: HookContext) -> list[str]:
