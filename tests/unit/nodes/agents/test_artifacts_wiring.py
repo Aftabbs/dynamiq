@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -22,6 +23,7 @@ from dynamiq.sandboxes.base import SandboxConfig
 from dynamiq.sandboxes.e2b import E2BSandbox
 from dynamiq.storages.file import FileStoreConfig, InMemoryFileStore
 from dynamiq.types.streaming import StreamingConfig, StreamingMode
+from tests.helpers.artifact_api import API_URL, ArtifactAPISimulator
 from tests.unit.artifacts.conftest import FakeArtifactBackend
 
 
@@ -360,6 +362,48 @@ def test_an_output_file_beside_artifacts_reaches_the_run_output(llm, store, mock
 
     assert result.status == RunnableStatus.SUCCESS
     assert [f.name for f in result.output["files"]] == ["totals.csv"]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(lambda agent, data: agent.run(data), id="sync"),
+        pytest.param(lambda agent, data: asyncio.run(agent.run_async(data)), id="async"),
+    ],
+)
+def test_an_apps_run_returns_its_artifact_without_a_link_and_tells_the_model_none(llm, mocker, monkeypatch, run):
+    api = ArtifactAPISimulator()
+    monkeypatch.setattr(Dynamiq, "connect", lambda self: api)
+    in_a_store = DynamiqArtifacts(
+        connection=Dynamiq(url=API_URL, api_key="simulated-key"), artifact_store_id="store-1", user_id="customer-42"
+    )
+    completion = _replies(
+        mocker,
+        _file_write({"action": "write", "file_path": "invoice.md", "content": "# Invoice 1042"}),
+        _action({"action": "create", "path": "invoice.md", "name": "Invoice 1042"}),
+        "Thought: Done.\nAnswer: Your invoice is ready.",
+    )
+    agent = Agent(
+        name="a", llm=llm, file_store=_files(), artifacts=_artifacts(in_a_store), inference_mode=InferenceMode.DEFAULT
+    )
+
+    result = run(agent, {"input": "Send me my invoice"})
+
+    assert result.status == RunnableStatus.SUCCESS
+    (artifact_id,) = api.artifacts
+    version_id = api.artifacts[artifact_id]["versions"][0]["id"]
+    assert json.loads(json.dumps(result.output["artifacts"])) == [
+        {
+            "id": artifact_id,
+            "version_id": version_id,
+            "version": 1,
+            "name": "Invoice 1042",
+            "kind": "markdown",
+            "url": None,
+        }
+    ]
+    assert "app.simulated" not in json.dumps(completion.call_args_list[-1].kwargs["messages"], default=str)
+    assert api.calls == [("POST", "")], "publishing stays one request"
 
 
 def _new_llm():

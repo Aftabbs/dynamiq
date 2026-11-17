@@ -38,6 +38,10 @@ class Dynamiq(ArtifactBackend):
     artifacts apart from another's; a call's own ``user_id``, the run's, overrides it. The platform
     does not check the store or the end user when an artifact is read by id, so this backend does:
     another store's or end user's artifact reads as not found.
+
+    With ``artifact_store_id`` an artifact carries no ``url``: the platform's link is the artifact's
+    page in its own app, which an app's end user has no account to open. The app shows the artifact
+    by its ``id``.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -328,8 +332,7 @@ class Dynamiq(ArtifactBackend):
             ) from exc
         return payload.get("data", payload) if isinstance(payload, dict) else payload
 
-    @classmethod
-    def _to_artifact(cls, data: dict[str, Any]) -> Artifact:
+    def _to_artifact(self, data: dict[str, Any]) -> Artifact:
         """Build an ``Artifact`` from an API payload, defaulting anything the server omits."""
         artifact_id = data.get("id") or ""
         file_name = data.get("file_name") or ""
@@ -352,8 +355,8 @@ class Dynamiq(ArtifactBackend):
             visibility=visibility,
             store_id=data.get("store_id"),
             user_id=data.get("user_id"),
-            latest_version=cls._to_version(latest, artifact_id) if isinstance(latest, dict) else None,
-            url=data.get("url"),
+            latest_version=self._to_version(latest, artifact_id) if isinstance(latest, dict) else None,
+            url=None if self.artifact_store_id is not None else data.get("url"),
         )
 
     @staticmethod

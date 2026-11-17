@@ -123,6 +123,14 @@ def test_create_in_a_store_names_the_store_and_end_user(client):
     assert kwargs["json"]["store_id"] == "s1"
     assert kwargs["json"]["user_id"] == "customer-42"
     assert (artifact.store_id, artifact.user_id) == ("s1", "customer-42")
+    assert artifact.to_ref() == {
+        "id": "a1",
+        "version_id": "v2",
+        "version": 2,
+        "name": "Q3 report",
+        "kind": "html",
+        "url": None,
+    }
 
 
 def test_create_binary_uploads_the_fields_as_one_json_part(backend, client):

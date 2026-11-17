@@ -54,7 +54,7 @@ def run(agent: Agent, query: str) -> list[dict]:
     output = result.output or {}
     logger.info(f"Answer: {output.get('content') or result.error}")
     for ref in output.get("artifacts", []):
-        logger.info(f"Artifact {ref['id']} v{ref['version']} ({ref['kind']}): {ref['url']}")
+        logger.info(f"Artifact {ref['id']} v{ref['version']} ({ref['kind']})")
     return output.get("artifacts", [])
 
 

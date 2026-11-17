@@ -37,7 +37,7 @@ WORKSPACE_DIR = "artifacts"
 STATE_PATH = posixpath.join(WORKSPACE_DIR, ".state.json")
 
 DESCRIPTION = """Publish deliverables the user opens, reviews and shares, and read documents already \
-published, by you or by others. Each artifact gets a link and a version history, and outlives this \
+published, by you or by others. Each artifact gets a version history, and outlives this \
 conversation. Artifacts move as files: you write and change files in your workspace with your file \
 tools, and this tool publishes them and loads them back. Look here with 'list' and 'get' when asked \
 about a report, record or document you do not have in this conversation.
